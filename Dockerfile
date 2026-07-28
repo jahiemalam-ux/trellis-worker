@@ -4,10 +4,11 @@ WORKDIR /app
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HF_HUB_ENABLE_HF_TRANSFER=0
 ENV HF_HUB_DISABLE_XET=1
-ENV CUDA_HOME=/usr/local/cuda-12.4
+ENV CUDA_HOME=/usr/local/cuda
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ENV TORCH_CUDA_ARCH_LIST="8.6"
 
+RUN ln -sfn $(ls -d /usr/local/cuda* 2>/dev/null | head -1) /usr/local/cuda || true
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git build-essential libgl1 libglib2.0-0 ninja-build libjpeg-dev && \
     rm -rf /var/lib/apt/lists/*
