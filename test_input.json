@@ -1,0 +1,6 @@
+{
+  "input": {
+    "image_b64": "<base64-png>",
+    "resolution": 1024
+  }
+}
