@@ -8,7 +8,7 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ENV TORCH_CUDA_ARCH_LIST="8.6"
 
-RUN ln -sfn $(ls -d /usr/local/cuda* 2>/dev/null | head -1) /usr/local/cuda || true
+RUN real_cuda=$(dirname $(dirname $(which nvcc 2>/dev/null) 2>/dev/null) 2>/dev/null); real_cuda=${real_cuda:-$(ls -d /usr/local/cuda-* 2>/dev/null | sort -V | tail -1)}; if [ -n "$real_cuda" ] && [ "$real_cuda" != "/usr/local/cuda" ]; then ln -sfn "$real_cuda" /usr/local/cuda; fi; echo "CUDA_HOME target: $real_cuda"; ls -la /usr/local/cuda/bin/nvcc || true
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git build-essential libgl1 libglib2.0-0 ninja-build libjpeg-dev && \
     rm -rf /var/lib/apt/lists/*
@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir \
     trimesh transformers tensorboard pandas lpips zstandard kornia timm && \
     pip install --no-cache-dir \
     git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8 && \
-    pip install --no-cache-dir pillow-simd
+    pip install --no-cache-dir pillow
 
 RUN pip install --no-cache-dir flash-attn==2.7.3 --no-build-isolation || \
     (git clone --recursive https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && \
