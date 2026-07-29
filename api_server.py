@@ -64,8 +64,43 @@ def generate(inp):
 
 def run_job(jid, inp):
     JOBS[jid]["status"] = "running"
+    JOBS[jid]["steps"] = []
+    def step(m):
+        JOBS[jid]["steps"].append(m)
+        print(f"[{jid}] {m}", flush=True)
     try:
-        JOBS[jid]["result"] = generate(inp)
+        step("decode+rembg start")
+        from PIL import Image
+        import io as _io, base64 as _b64
+        image = Image.open(_io.BytesIO(_b64.b64decode(inp["image_b64"]))).convert("RGB")
+        step(f"image {image.size}")
+        global _REMBG_SESSION
+        if _REMBG_SESSION is None:
+            from rembg import new_session
+            _REMBG_SESSION = new_session("u2net")
+            step("rembg session ready")
+        from rembg import remove as _rmbg
+        image = _rmbg(image, session=_REMBG_SESSION)
+        step("rembg done")
+        import o_voxel
+        kwargs = {"seed": int(inp.get("seed", 42))}
+        if inp.get("pipeline_type"):
+            kwargs["pipeline_type"] = inp["pipeline_type"]
+        step("pipeline.run start")
+        mesh = PIPE.run(image, **kwargs)[0]
+        step("pipeline.run done")
+        mesh.simplify(16_777_216)
+        glb = o_voxel.postprocess.to_glb(
+            vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
+            coords=mesh.coords, attr_layout=mesh.layout, voxel_size=mesh.voxel_size,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            decimation_target=int(inp.get("decimation_target", 1_000_000)),
+            texture_size=int(inp.get("texture_size", 4096)),
+            remesh=True, remesh_band=1, remesh_project=0, verbose=False)
+        glb.export("/tmp/out.glb", extension_webp=True)
+        step("glb exported")
+        with open("/tmp/out.glb", "rb") as f:
+            JOBS[jid]["result"] = {"glb_b64": _b64.b64encode(f.read()).decode(), "engine": "trellis2-4b"}
         JOBS[jid]["status"] = "done"
     except Exception as e:
         JOBS[jid]["error"] = f"{e}\n{traceback.format_exc()[-2500:]}"
@@ -89,7 +124,7 @@ class H(BaseHTTPRequestHandler):
             j = JOBS.get(jid)
             if not j:
                 return self._send(404, {"error": "unknown job"})
-            out = {"status": j["status"]}
+            out = {"status": j["status"], "steps": j.get("steps", [])}
             if j["status"] == "done":
                 out["result"] = j["result"]
             if j["status"] == "failed":
