@@ -6,7 +6,7 @@ ENV HF_HUB_ENABLE_HF_TRANSFER=0
 ENV HF_HUB_DISABLE_XET=1
 ENV CUDA_HOME=/usr/local/cuda
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-ENV TORCH_CUDA_ARCH_LIST="8.6"
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.6+PTX"
 
 RUN real_cuda=$(dirname $(dirname $(which nvcc 2>/dev/null) 2>/dev/null) 2>/dev/null); real_cuda=${real_cuda:-$(ls -d /usr/local/cuda-* 2>/dev/null | sort -V | tail -1)}; if [ -n "$real_cuda" ] && [ "$real_cuda" != "/usr/local/cuda" ]; then ln -sfn "$real_cuda" /usr/local/cuda; fi; echo "CUDA_HOME target: $real_cuda"; ls -la /usr/local/cuda/bin/nvcc || true
 RUN apt-get update && apt-get install -y --no-install-recommends \
