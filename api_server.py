@@ -1,4 +1,4 @@
-import base64, io, os, traceback, json, threading
+import base64, io, os, traceback, json, threading, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -7,6 +7,7 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 PIPE = None
 LOAD_ERROR = None
 BOOT_LOG = []
+JOBS = {}  # id -> {status, result, error}
 
 def log(msg):
     BOOT_LOG.append(str(msg))
@@ -26,21 +27,15 @@ def eager_load():
         log(f"LOAD FAILED: {e}")
 
 def generate(inp):
-    img_b64 = inp.get("image_b64")
-    if not img_b64:
-        return {"error": "image_b64 required"}
     from PIL import Image
     import o_voxel
-    image = Image.open(io.BytesIO(base64.b64decode(img_b64)))
-    # Convert to RGBA with opaque alpha -> pipeline skips gated RMBG-2.0.
-    # (Golf photos are already background-removed upstream.)
+    image = Image.open(io.BytesIO(base64.b64decode(inp["image_b64"])))
     if image.mode != "RGBA":
         image = image.convert("RGBA")
-    pipe = PIPE
     kwargs = {"seed": int(inp.get("seed", 42))}
-    if inp.get("resolution"):
-        kwargs["resolution"] = int(inp["resolution"])
-    mesh = pipe.run(image, **kwargs)[0]
+    if inp.get("pipeline_type"):
+        kwargs["pipeline_type"] = inp["pipeline_type"]
+    mesh = PIPE.run(image, **kwargs)[0]
     mesh.simplify(16_777_216)
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
@@ -52,6 +47,15 @@ def generate(inp):
     glb.export("/tmp/out.glb", extension_webp=True)
     with open("/tmp/out.glb", "rb") as f:
         return {"glb_b64": base64.b64encode(f.read()).decode(), "engine": "trellis2-4b"}
+
+def run_job(jid, inp):
+    JOBS[jid]["status"] = "running"
+    try:
+        JOBS[jid]["result"] = generate(inp)
+        JOBS[jid]["status"] = "done"
+    except Exception as e:
+        JOBS[jid]["error"] = f"{e}\n{traceback.format_exc()[-2500:]}"
+        JOBS[jid]["status"] = "failed"
 
 class H(BaseHTTPRequestHandler):
     def _send(self, code, obj):
@@ -66,6 +70,17 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send(200, {"ok": LOAD_ERROR is None, "loaded": PIPE is not None,
                              "load_error": LOAD_ERROR, "log": BOOT_LOG[-25:]})
+        elif self.path.startswith("/job/"):
+            jid = self.path[5:]
+            j = JOBS.get(jid)
+            if not j:
+                return self._send(404, {"error": "unknown job"})
+            out = {"status": j["status"]}
+            if j["status"] == "done":
+                out["result"] = j["result"]
+            if j["status"] == "failed":
+                out["error"] = j["error"]
+            self._send(200, out)
         else:
             self._send(404, {"error": "not found"})
 
@@ -77,12 +92,11 @@ class H(BaseHTTPRequestHandler):
             return self._send(400, {"error": f"bad json: {e}"})
         if self.path == "/generate":
             if PIPE is None:
-                return self._send(200, {"error": "model not loaded yet", "load_error": LOAD_ERROR,
-                                        "log": BOOT_LOG[-15:]})
-            try:
-                self._send(200, generate(inp))
-            except Exception as e:
-                self._send(200, {"error": str(e), "trace": traceback.format_exc()[-3000:]})
+                return self._send(200, {"error": "model not loaded", "load_error": LOAD_ERROR})
+            jid = uuid.uuid4().hex[:12]
+            JOBS[jid] = {"status": "queued"}
+            threading.Thread(target=run_job, args=(jid, inp), daemon=True).start()
+            self._send(200, {"job_id": jid})
         else:
             self._send(404, {"error": "not found"})
 
@@ -90,7 +104,6 @@ class H(BaseHTTPRequestHandler):
         pass
 
 if __name__ == "__main__":
-    log("api_server starting, eager-loading model")
-    t = threading.Thread(target=eager_load, daemon=True)
-    t.start()
+    log("api_server v3 starting, eager-loading model")
+    threading.Thread(target=eager_load, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
