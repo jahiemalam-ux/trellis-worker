@@ -62,6 +62,11 @@ RUN sed -i "s|pipeline.rembg_model = getattr(rembg, args\['rembg_model'\]\['name
 # Pre-download rembg u2net model so first generate() doesn't hang on download
 RUN python -c "from rembg import new_session; new_session('u2net')" || echo "u2net predownload failed, will retry at runtime"
 
+# Hard-pin transformers>=4.56 (DINOv3ViTModel.layer) AFTER all installs so nothing downgrades it
+RUN pip install --no-cache-dir --force-reinstall --no-deps 'transformers==4.56.0' && \
+    pip install --no-cache-dir 'tokenizers>=0.20' 'safetensors' 'huggingface-hub>=0.24' 'regex' 'pyyaml' 'numpy' 'packaging' 'tqdm' 'requests' && \
+    python -c "import transformers; from transformers import DINOv3ViTModel; print('transformers', transformers.__version__)"
+
 ENV PYTHONPATH=/app/TRELLIS.2
 WORKDIR /app
 CMD ["python", "-u", "api_server.py"]
