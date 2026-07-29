@@ -7,6 +7,7 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 PIPE = None
 LOAD_ERROR = None
 BOOT_LOG = []
+_REMBG_SESSION = None
 JOBS = {}  # id -> {status, result, error}
 
 def log(msg):
@@ -39,9 +40,12 @@ def generate(inp):
     from PIL import Image
     import o_voxel
     image = Image.open(io.BytesIO(base64.b64decode(inp["image_b64"]))).convert("RGB")
-    # Real alpha mask via local rembg (u2net, already in image) -> pipeline skips gated RMBG-2.0
+    global _REMBG_SESSION
+    if _REMBG_SESSION is None:
+        from rembg import new_session
+        _REMBG_SESSION = new_session("u2net")
     from rembg import remove as _rmbg
-    image = _rmbg(image)
+    image = _rmbg(image, session=_REMBG_SESSION)
     kwargs = {"seed": int(inp.get("seed", 42))}
     if inp.get("pipeline_type"):
         kwargs["pipeline_type"] = inp["pipeline_type"]
