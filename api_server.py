@@ -20,7 +20,16 @@ def eager_load():
         log(f"torch {torch.__version__} cuda={torch.cuda.is_available()}")
         from trellis2.pipelines import Trellis2ImageTo3DPipeline
         PIPE = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
-        PIPE.cuda()
+        # Official app pattern: low_vram pipeline manages device moves per-call.
+        # Just ensure the conditioning model is on GPU and stays there.
+        try:
+            PIPE.image_cond_model.cuda()
+        except Exception:
+            pass
+        try:
+            PIPE.to("cuda")
+        except Exception:
+            pass
         log("MODEL READY")
     except Exception as e:
         LOAD_ERROR = f"{e}\n{traceback.format_exc()[-2500:]}"
