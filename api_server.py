@@ -38,9 +38,10 @@ def eager_load():
 def generate(inp):
     from PIL import Image
     import o_voxel
-    image = Image.open(io.BytesIO(base64.b64decode(inp["image_b64"])))
-    if image.mode != "RGBA":
-        image = image.convert("RGBA")
+    image = Image.open(io.BytesIO(base64.b64decode(inp["image_b64"]))).convert("RGB")
+    # Real alpha mask via local rembg (u2net, already in image) -> pipeline skips gated RMBG-2.0
+    from rembg import remove as _rmbg
+    image = _rmbg(image)
     kwargs = {"seed": int(inp.get("seed", 42))}
     if inp.get("pipeline_type"):
         kwargs["pipeline_type"] = inp["pipeline_type"]
