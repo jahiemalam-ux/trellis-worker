@@ -21,8 +21,6 @@ def eager_load():
         log(f"torch {torch.__version__} cuda={torch.cuda.is_available()}")
         from trellis2.pipelines import Trellis2ImageTo3DPipeline
         PIPE = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
-        # Official app pattern: low_vram pipeline manages device moves per-call.
-        # Just ensure the conditioning model is on GPU and stays there.
         try:
             PIPE.image_cond_model.cuda()
         except Exception:
@@ -36,21 +34,69 @@ def eager_load():
         LOAD_ERROR = f"{e}\n{traceback.format_exc()[-2500:]}"
         log(f"LOAD FAILED: {e}")
 
-def generate(inp):
+def rembg_image(b64):
     from PIL import Image
-    import o_voxel
-    image = Image.open(io.BytesIO(base64.b64decode(inp["image_b64"]))).convert("RGB")
     global _REMBG_SESSION
     if _REMBG_SESSION is None:
         from rembg import new_session
         _REMBG_SESSION = new_session("u2net")
     from rembg import remove as _rmbg
-    image = _rmbg(image, session=_REMBG_SESSION)
-    kwargs = {"seed": int(inp.get("seed", 42))}
-    if inp.get("pipeline_type"):
-        kwargs["pipeline_type"] = inp["pipeline_type"]
-    mesh = PIPE.run(image, **kwargs)[0]
-    mesh.simplify(16_777_216)
+    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    return _rmbg(img, session=_REMBG_SESSION)
+
+def run_multi(images, seed, pipeline_type, max_num_tokens=49152,
+              ss_params=None, shape_params=None, tex_params=None, step=None):
+    """Multi-view generation: average DINOv3 conditioning across views, then
+    follow the exact same sampling flow as pipeline.run()."""
+    import torch
+    ss_params = ss_params or {}
+    shape_params = shape_params or {}
+    tex_params = tex_params or {}
+    imgs = [PIPE.preprocess_image(im) for im in images]
+    torch.manual_seed(seed)
+
+    def fused_cond(res):
+        conds = []
+        for im in imgs:
+            c = PIPE.get_cond([im], res, include_neg_cond=False)['cond']
+            conds.append(c)
+        c = torch.stack(conds).mean(dim=0)
+        return {'cond': c, 'neg_cond': torch.zeros_like(c)}
+
+    if step: step(f"fused cond over {len(imgs)} views")
+    cond_512 = fused_cond(512)
+    cond_1024 = fused_cond(1024) if pipeline_type != '512' else None
+    ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
+    coords = PIPE.sample_sparse_structure(cond_512, ss_res, 1, ss_params)
+    if step: step("sparse structure done")
+    if pipeline_type == '512':
+        shape_slat = PIPE.sample_shape_slat(cond_512, PIPE.models['shape_slat_flow_model_512'], coords, shape_params)
+        tex_slat = PIPE.sample_tex_slat(cond_512, PIPE.models['tex_slat_flow_model_512'], shape_slat, tex_params)
+        res = 512
+    elif pipeline_type == '1024':
+        shape_slat = PIPE.sample_shape_slat(cond_1024, PIPE.models['shape_slat_flow_model_1024'], coords, shape_params)
+        tex_slat = PIPE.sample_tex_slat(cond_1024, PIPE.models['tex_slat_flow_model_1024'], shape_slat, tex_params)
+        res = 1024
+    elif pipeline_type == '1024_cascade':
+        shape_slat, res = PIPE.sample_shape_slat_cascade(
+            cond_512, cond_1024,
+            PIPE.models['shape_slat_flow_model_512'], PIPE.models['shape_slat_flow_model_1024'],
+            512, 1024, coords, shape_params, max_num_tokens)
+        tex_slat = PIPE.sample_tex_slat(cond_1024, PIPE.models['tex_slat_flow_model_1024'], shape_slat, tex_params)
+    elif pipeline_type == '1536_cascade':
+        shape_slat, res = PIPE.sample_shape_slat_cascade(
+            cond_512, cond_1024,
+            PIPE.models['shape_slat_flow_model_512'], PIPE.models['shape_slat_flow_model_1024'],
+            512, 1536, coords, shape_params, max_num_tokens)
+        tex_slat = PIPE.sample_tex_slat(cond_1024, PIPE.models['tex_slat_flow_model_1024'], shape_slat, tex_params)
+    else:
+        raise ValueError(f"Invalid pipeline type: {pipeline_type}")
+    if step: step("shape+texture slat done")
+    torch.cuda.empty_cache()
+    return PIPE.decode_latent(shape_slat, tex_slat, res)
+
+def export_glb(mesh, inp):
+    import o_voxel
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
         coords=mesh.coords, attr_layout=mesh.layout, voxel_size=mesh.voxel_size,
@@ -70,37 +116,25 @@ def run_job(jid, inp):
         print(f"[{jid}] {m}", flush=True)
     try:
         step("decode+rembg start")
-        from PIL import Image
-        import io as _io, base64 as _b64
-        image = Image.open(_io.BytesIO(_b64.b64decode(inp["image_b64"]))).convert("RGB")
-        step(f"image {image.size}")
-        global _REMBG_SESSION
-        if _REMBG_SESSION is None:
-            from rembg import new_session
-            _REMBG_SESSION = new_session("u2net")
-            step("rembg session ready")
-        from rembg import remove as _rmbg
-        image = _rmbg(image, session=_REMBG_SESSION)
-        step("rembg done")
-        import o_voxel
-        kwargs = {"seed": int(inp.get("seed", 42))}
-        if inp.get("pipeline_type"):
-            kwargs["pipeline_type"] = inp["pipeline_type"]
-        step("pipeline.run start")
-        mesh = PIPE.run(image, **kwargs)[0]
-        step("pipeline.run done")
+        b64s = inp.get("images_b64") or [inp["image_b64"]]
+        images = []
+        for b in b64s:
+            images.append(rembg_image(b))
+        step(f"rembg done x{len(images)}")
+        seed = int(inp.get("seed", 42))
+        pipeline_type = inp.get("pipeline_type", "1024_cascade")
+        max_tokens = int(inp.get("max_num_tokens", 49152))
+        step("pipeline start")
+        if len(images) > 1:
+            out = run_multi(images, seed, pipeline_type, max_tokens, step=step)
+            mesh = out[0]
+        else:
+            mesh = PIPE.run(images[0], seed=seed, pipeline_type=pipeline_type,
+                            max_num_tokens=max_tokens, preprocess_image=True)[0]
+        step("pipeline done")
         mesh.simplify(16_777_216)
-        glb = o_voxel.postprocess.to_glb(
-            vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
-            coords=mesh.coords, attr_layout=mesh.layout, voxel_size=mesh.voxel_size,
-            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            decimation_target=int(inp.get("decimation_target", 1_000_000)),
-            texture_size=int(inp.get("texture_size", 4096)),
-            remesh=True, remesh_band=1, remesh_project=0, verbose=False)
-        glb.export("/tmp/out.glb", extension_webp=True)
+        JOBS[jid]["result"] = export_glb(mesh, inp)
         step("glb exported")
-        with open("/tmp/out.glb", "rb") as f:
-            JOBS[jid]["result"] = {"glb_b64": _b64.b64encode(f.read()).decode(), "engine": "trellis2-4b"}
         JOBS[jid]["status"] = "done"
     except Exception as e:
         JOBS[jid]["error"] = f"{e}\n{traceback.format_exc()[-2500:]}"
@@ -153,6 +187,6 @@ class H(BaseHTTPRequestHandler):
         pass
 
 if __name__ == "__main__":
-    log("api_server v3 starting, eager-loading model")
+    log("api_server v4 starting, eager-loading model")
     threading.Thread(target=eager_load, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
