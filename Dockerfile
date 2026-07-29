@@ -50,6 +50,10 @@ RUN sed -i "s|DINOv3ViTModel.from_pretrained(model_name)|DINOv3ViTModel.from_pre
     /app/TRELLIS.2/trellis2/modules/image_feature_extractor.py && \
     grep -n "from_pretrained" /app/TRELLIS.2/trellis2/modules/image_feature_extractor.py | head -3
 
+
+RUN sed -i "s|pipeline.rembg_model = getattr(rembg, args\['rembg_model'\]\['name'\])(\*\*args\['rembg_model'\]\['args'\])|pipeline.rembg_model = None|" \
+    /app/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py && \
+    grep -n "rembg_model" /app/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py | head -4
 ENV PYTHONPATH=/app/TRELLIS.2
 WORKDIR /app
 CMD ["python", "-u", "api_server.py"]
