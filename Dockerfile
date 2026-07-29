@@ -46,9 +46,17 @@ COPY api_server.py /app/api_server.py
 # --- Self-contained DINOv3 (gated on HF; mirror via ModelScope) ---
 RUN pip install --no-cache-dir modelscope && \
     python -c "from modelscope import snapshot_download; snapshot_download('facebook/dinov3-vitl16-pretrain-lvd1689m', local_dir='/opt/dinov3')"
-RUN sed -i "s|DINOv3ViTModel.from_pretrained(model_name)|DINOv3ViTModel.from_pretrained('/opt/dinov3')|" \
-    /app/TRELLIS.2/trellis2/modules/image_feature_extractor.py && \
-    grep -n "from_pretrained" /app/TRELLIS.2/trellis2/modules/image_feature_extractor.py | head -3
+# Patch DinoV3FeatureExtractor: load from local mirror AND use encoder.layer
+RUN python - <<'PYFIX'
+import re
+p = "/app/TRELLIS.2/trellis2/modules/image_feature_extractor.py"
+s = open(p).read()
+s = s.replace("DINOv3ViTModel.from_pretrained(model_name)", "DINOv3ViTModel.from_pretrained('/opt/dinov3')")
+# encoder.layer instead of .layer for newer transformers
+s = s.replace("for i, layer_module in enumerate(self.model.layer):", "for i, layer_module in enumerate(self.model.encoder.layer):")
+open(p, "w").write(s)
+print("patched:", "encoder.layer" in s, "/opt/dinov3" in s)
+PYFIX
 
 
 RUN sed -i "s|pipeline.rembg_model = getattr(rembg, args\['rembg_model'\]\['name'\])(\*\*args\['rembg_model'\]\['args'\])|pipeline.rembg_model = None|" \
