@@ -54,6 +54,9 @@ RUN sed -i "s|DINOv3ViTModel.from_pretrained(model_name)|DINOv3ViTModel.from_pre
 RUN sed -i "s|pipeline.rembg_model = getattr(rembg, args\['rembg_model'\]\['name'\])(\*\*args\['rembg_model'\]\['args'\])|pipeline.rembg_model = None|" \
     /app/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py && \
     grep -n "rembg_model" /app/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py | head -4
+# Pre-download rembg u2net model so first generate() doesn't hang on download
+RUN python -c "from rembg import new_session; new_session('u2net')"
+
 ENV PYTHONPATH=/app/TRELLIS.2
 WORKDIR /app
 CMD ["python", "-u", "api_server.py"]
