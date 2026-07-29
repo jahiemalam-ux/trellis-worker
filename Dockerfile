@@ -41,6 +41,7 @@ RUN pip install ./o-voxel --no-build-isolation
 RUN pip install --no-cache-dir runpod pillow rembg
 
 COPY handler.py /app/handler.py
+COPY api_server.py /app/api_server.py
 
 WORKDIR /app
 CMD ["python3", "-u", "handler.py"]
