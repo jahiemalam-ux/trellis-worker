@@ -64,7 +64,7 @@ RUN python -c "from rembg import new_session; new_session('u2net')" || echo "u2n
 
 # Hard-pin transformers>=4.56 (DINOv3ViTModel.layer) AFTER all installs so nothing downgrades it
 RUN pip install --no-cache-dir --force-reinstall --no-deps 'transformers==4.56.0' && \
-    pip install --no-cache-dir 'tokenizers>=0.20' 'safetensors' 'huggingface-hub>=0.24' 'regex' 'pyyaml' 'numpy' 'packaging' 'tqdm' 'requests' && \
+    pip install --no-cache-dir 'tokenizers>=0.20' 'safetensors' 'huggingface-hub==0.34.4' 'regex' 'pyyaml' 'numpy' 'packaging' 'tqdm' 'requests' && \
     python -c "import transformers; from transformers import DINOv3ViTModel; print('transformers', transformers.__version__)"
 
 ENV PYTHONPATH=/app/TRELLIS.2
