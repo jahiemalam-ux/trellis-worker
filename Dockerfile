@@ -41,7 +41,6 @@ RUN pip install ./o-voxel --no-build-isolation
 RUN pip install --no-cache-dir runpod pillow rembg
 
 COPY handler.py /app/handler.py
-RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('microsoft/TRELLIS.2-4B')" || true
 
 WORKDIR /app
 CMD ["python3", "-u", "handler.py"]
