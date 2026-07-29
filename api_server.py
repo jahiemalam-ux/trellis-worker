@@ -1,28 +1,29 @@
-import base64, io, os, traceback, json
+import base64, io, os, traceback, json, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 
 PIPE = None
+LOAD_ERROR = None
 BOOT_LOG = []
 
 def log(msg):
     BOOT_LOG.append(str(msg))
     print(msg, flush=True)
 
-def get_pipe():
-    global PIPE
-    if PIPE is None:
+def eager_load():
+    global PIPE, LOAD_ERROR
+    try:
         import torch
-        log(f"torch {torch.__version__} cuda_avail={torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            log(f"gpu={torch.cuda.get_device_name(0)} cap={torch.cuda.get_device_capability(0)}")
+        log(f"torch {torch.__version__} cuda={torch.cuda.is_available()}")
         from trellis2.pipelines import Trellis2ImageTo3DPipeline
         PIPE = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
         PIPE.cuda()
-        log("pipeline loaded")
-    return PIPE
+        log("MODEL READY")
+    except Exception as e:
+        LOAD_ERROR = f"{e}\n{traceback.format_exc()[-2500:]}"
+        log(f"LOAD FAILED: {e}")
 
 def generate(inp):
     img_b64 = inp.get("image_b64")
@@ -30,8 +31,12 @@ def generate(inp):
         return {"error": "image_b64 required"}
     from PIL import Image
     import o_voxel
-    image = Image.open(io.BytesIO(base64.b64decode(img_b64))).convert("RGB")
-    pipe = get_pipe()
+    image = Image.open(io.BytesIO(base64.b64decode(img_b64)))
+    # Convert to RGBA with opaque alpha -> pipeline skips gated RMBG-2.0.
+    # (Golf photos are already background-removed upstream.)
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    pipe = PIPE
     kwargs = {"seed": int(inp.get("seed", 42))}
     if inp.get("resolution"):
         kwargs["resolution"] = int(inp["resolution"])
@@ -59,14 +64,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            try:
-                import torch
-                self._send(200, {"ok": True, "torch": torch.__version__,
-                                 "cuda": torch.cuda.is_available(),
-                                 "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-                                 "loaded": PIPE is not None, "log": BOOT_LOG[-20:]})
-            except Exception as e:
-                self._send(200, {"ok": False, "error": str(e), "trace": traceback.format_exc()[-2000:], "log": BOOT_LOG[-20:]})
+            self._send(200, {"ok": LOAD_ERROR is None, "loaded": PIPE is not None,
+                             "load_error": LOAD_ERROR, "log": BOOT_LOG[-25:]})
         else:
             self._send(404, {"error": "not found"})
 
@@ -77,16 +76,13 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send(400, {"error": f"bad json: {e}"})
         if self.path == "/generate":
+            if PIPE is None:
+                return self._send(200, {"error": "model not loaded yet", "load_error": LOAD_ERROR,
+                                        "log": BOOT_LOG[-15:]})
             try:
                 self._send(200, generate(inp))
             except Exception as e:
-                self._send(200, {"error": str(e), "trace": traceback.format_exc()[-3000:], "log": BOOT_LOG[-20:]})
-        elif self.path == "/preload":
-            try:
-                get_pipe()
-                self._send(200, {"ok": True, "log": BOOT_LOG[-20:]})
-            except Exception as e:
-                self._send(200, {"ok": False, "error": str(e), "trace": traceback.format_exc()[-3000:]})
+                self._send(200, {"error": str(e), "trace": traceback.format_exc()[-3000:]})
         else:
             self._send(404, {"error": "not found"})
 
@@ -94,5 +90,7 @@ class H(BaseHTTPRequestHandler):
         pass
 
 if __name__ == "__main__":
-    log("api_server starting on :8080")
+    log("api_server starting, eager-loading model")
+    t = threading.Thread(target=eager_load, daemon=True)
+    t.start()
     ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
