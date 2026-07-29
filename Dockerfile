@@ -38,7 +38,7 @@ RUN git clone --recursive https://github.com/JeffreyXiang/FlexGEMM.git /tmp/ext/
     pip install /tmp/ext/FlexGEMM --no-build-isolation
 RUN pip install ./o-voxel --no-build-isolation
 
-RUN pip install --no-cache-dir runpod pillow rembg
+RUN pip install --no-cache-dir runpod pillow rembg onnxruntime
 
 COPY handler.py /app/handler.py
 COPY api_server.py /app/api_server.py
@@ -55,7 +55,7 @@ RUN sed -i "s|pipeline.rembg_model = getattr(rembg, args\['rembg_model'\]\['name
     /app/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py && \
     grep -n "rembg_model" /app/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py | head -4
 # Pre-download rembg u2net model so first generate() doesn't hang on download
-RUN python -c "from rembg import new_session; new_session('u2net')"
+RUN python -c "from rembg import new_session; new_session('u2net')" || echo "u2net predownload failed, will retry at runtime"
 
 ENV PYTHONPATH=/app/TRELLIS.2
 WORKDIR /app
