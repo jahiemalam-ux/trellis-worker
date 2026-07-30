@@ -11,6 +11,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The image is >12GB before Blender is added, and a stock ubuntu-latest
+      # runner only leaves ~14GB free — build #29 died with "No space left on
+      # device". Reclaiming preinstalled toolchains we never use buys ~30GB.
+      - name: Reclaim runner disk
+        run: |
+          echo "=== before ==="
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/local/share/chromium \
+            /usr/local/lib/node_modules \
+            /opt/hostedtoolcache/CodeQL \
+            "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean || true
+          docker system prune -af --volumes || true
+          echo "=== after ==="
+          df -h /
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -27,5 +50,12 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/trellis-worker:v1
+          # mode=max caches every intermediate layer, which itself consumes
+          # runner disk on a build this size. mode=min keeps the expensive
+          # compile layers cached without hoarding the rest.
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
+
+      - name: Disk usage after build
+        if: always()
+        run: df -h /

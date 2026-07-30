@@ -92,11 +92,9 @@ RUN pip install --no-cache-dir --no-deps diffusers==0.31.0 && \
     python -c "import diffusers; print('diffusers', diffusers.__version__)" && \
     python -c "import transformers; print('transformers', transformers.__version__)"
 
-# Pre-fetch SDXL-Turbo weights at build time so first prompt isn't a long download.
-RUN python -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download('stabilityai/sdxl-turbo', allow_patterns=['*.json','*.txt','*fp16*','*.safetensors'], ignore_patterns=['*.ckpt','*nonema*','*.bin'])" \
-    || echo "sdxl-turbo predownload failed, will fetch at runtime"
+# SDXL-Turbo weights are deliberately NOT baked in: ~7GB would blow the CI runner's
+# ~14GB disk and slow every pod cold start. txt2img.py lazy-loads on first prompt.
+# Set HF_HOME to a persistent volume if you want to cache them across pods.
 
 COPY blender_post.py /app/blender_post.py
 COPY txt2img.py /app/txt2img.py
