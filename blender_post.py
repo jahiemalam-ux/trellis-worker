@@ -215,13 +215,22 @@ def retopologize(obj, target_faces, allow_decimate=True):
 
     if manifold:
         try:
+            # mode="FACES" is essential: the operator defaults to RATIO with
+            # target_ratio=1.0, which rebuilds at the SAME density and silently
+            # ignores target_faces (observed: 201870 in -> 201870 out).
             bpy.ops.object.quadriflow_remesh(
+                mode="FACES",
                 target_faces=target_faces,
                 use_preserve_sharp=False,
                 use_preserve_boundary=False,
                 use_mesh_symmetry=False,
                 smooth_normals=True,
             )
+            achieved = mesh_stats(obj)[1]
+            if achieved > target_faces * 3:
+                # Guard against the operator no-op'ing again on a future version.
+                log(f"WARNING: quadriflow returned {achieved} faces for a "
+                    f"{target_faces} budget — target may have been ignored")
             log(f"retopo: quadriflow -> {mesh_stats(obj)[1]} faces "
                 f"(watertight={count_holes(obj) == 0})")
             return "quadriflow"
