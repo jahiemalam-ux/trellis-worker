@@ -148,6 +148,8 @@ def blender_finish(raw_glb, inp, step=None):
         cmd += ["--repair-detail", str(int(inp["repair_detail"]))]
     if inp.get("cage_ratio"):
         cmd += ["--cage-ratio", str(float(inp["cage_ratio"]))]
+    if inp.get("no_pbr"):
+        cmd.append("--no-pbr")
 
     if step: step("blender: starting")
     timeout = int(inp.get("blender_timeout", 900))

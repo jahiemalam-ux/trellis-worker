@@ -42,6 +42,8 @@ def parse_args():
     p.add_argument("--cage-ratio", type=float, default=0.05,
                    help="bake cage extrusion as a fraction of the bounding box")
     p.add_argument("--no-bake", action="store_true")
+    p.add_argument("--no-pbr", action="store_true",
+                   help="skip normal/roughness map baking (baseColor only)")
     p.add_argument("--no-repair", action="store_true",
                    help="skip manifold repair (quads/watertight become unlikely)")
     p.add_argument("--no-decimate-fallback", action="store_true",
@@ -414,15 +416,134 @@ def bake_color(src, tgt, texture_size, samples, img, cage_ratio=0.05):
     return best[0], best[2]
 
 
+def bake_normal_map(src, tgt, texture_size, cage_ratio=0.05):
+    """
+    Bake a tangent-space normal map from the dense source onto the retopo mesh.
+
+    This is the biggest single quality lever the audit surfaced: professional
+    GLBs (DamagedHelmet: 15k faces, lum 116) carry a normal map that preserves
+    all the fine surface relief we decimate away. Without it, a low-poly mesh
+    reads as a smooth lump no matter how good the color is.
+    """
+    img = bpy.data.images.new(
+        "BakedNormal", texture_size, texture_size, alpha=False,
+        float_buffer=True,   # normals need >8-bit precision to avoid banding
+    )
+    img.colorspace_settings.name = "Non-Color"
+
+    mat = tgt.data.materials[0]
+    nt = mat.node_tree
+    node = nt.nodes.new("ShaderNodeTexImage")
+    node.image = img
+    node.name = "NORMAL_TARGET"
+    nt.nodes.active = node
+
+    dims = src.dimensions
+    largest = max(dims.x, dims.y, dims.z) or 1.0
+    ext = max(largest * cage_ratio * 3.0, 1e-4)  # normals need a slightly bigger cage
+    margin = max(texture_size // 256, 4)
+
+    scene = bpy.context.scene
+    scene.render.bake.use_selected_to_active = True
+    scene.render.bake.cage_extrusion = ext
+    scene.render.bake.margin = margin
+    scene.render.bake.use_clear = True
+
+    bpy.ops.object.select_all(action="DESELECT")
+    src.select_set(True)
+    tgt.select_set(True)
+    bpy.context.view_layer.objects.active = tgt
+    try:
+        bpy.ops.object.bake(type="NORMAL", use_selected_to_active=True,
+                            cage_extrusion=ext, margin=margin)
+        log(f"bake: normal map done (extrusion={ext:.4f})")
+        return img, node
+    except Exception as e:
+        log(f"bake: normal map FAILED: {e}")
+        nt.nodes.remove(node)
+        bpy.data.images.remove(img)
+        return None, None
+
+
+def bake_roughness_map(src, tgt, texture_size):
+    """
+    Bake roughness. TRELLIS output has no real material data, so this mostly
+    captures the source's uniform roughness — but having the channel present,
+    and letting us push metallic paint vs matte rubber later, matters more than
+    the values themselves. A flat mid-roughness already beats none (no channel
+    = fully rough = zero specular highlight = the "dead plastic" look).
+    """
+    img = bpy.data.images.new("BakedRoughness", texture_size, texture_size, alpha=False)
+    img.colorspace_settings.name = "Non-Color"
+
+    mat = tgt.data.materials[0]
+    nt = mat.node_tree
+    node = nt.nodes.new("ShaderNodeTexImage")
+    node.image = img
+    node.name = "ROUGH_TARGET"
+    nt.nodes.active = node
+
+    margin = max(texture_size // 256, 4)
+    try:
+        bpy.ops.object.bake(type="ROUGHNESS", use_selected_to_active=True, margin=margin)
+        log("bake: roughness map done")
+        return img, node
+    except Exception as e:
+        log(f"bake: roughness FAILED: {e}")
+        nt.nodes.remove(node)
+        bpy.data.images.remove(img)
+        return None, None
+
+
+def wire_pbr_material(tgt, basecolor_tex, normal_img, rough_img):
+    """
+    Rebuild tgt's material as a proper PBR graph so the baked maps actually
+    export in the GLB. Without this the normal/roughness images exist but are
+    never referenced, and glTF drops them.
+    """
+    mat = tgt.data.materials[0]
+    nt = mat.node_tree
+    for n in list(nt.nodes):
+        nt.nodes.remove(n)
+
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+    base = nt.nodes.new("ShaderNodeTexImage")
+    base.image = basecolor_tex.image
+    nt.links.new(base.outputs["Color"], bsdf.inputs["Base Color"])
+
+    if rough_img is not None:
+        r = nt.nodes.new("ShaderNodeTexImage")
+        r.image = rough_img
+        r.image.colorspace_settings.name = "Non-Color"
+        nt.links.new(r.outputs["Color"], bsdf.inputs["Roughness"])
+
+    if normal_img is not None:
+        n = nt.nodes.new("ShaderNodeTexImage")
+        n.image = normal_img
+        n.image.colorspace_settings.name = "Non-Color"
+        nmap = nt.nodes.new("ShaderNodeNormalMap")
+        nt.links.new(n.outputs["Color"], nmap.inputs["Color"])
+        nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+
+    log(f"pbr material wired: basecolor + "
+        f"{'normal ' if normal_img else ''}{'roughness' if rough_img else ''}")
+
+
 def export_glb(obj, path, texture_size):
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
 
-    # Pack the baked image so it travels inside the .glb.
+    # Pack every baked image so they travel inside the .glb.
     for img in bpy.data.images:
-        if img.name == "BakedBaseColor":
-            img.pack()
+        if img.name in ("BakedBaseColor", "BakedNormal", "BakedRoughness"):
+            try:
+                img.pack()
+            except Exception:
+                pass
 
     bpy.ops.export_scene.gltf(
         filepath=path,
@@ -467,15 +588,32 @@ def main():
 
     baked = False
     bake_quality = "n/a"
+    pbr_maps = "none"
     if not args.no_bake:
         try:
-            bake_img, _ = make_bake_target(tgt, args.texture_size)
+            bake_tex_node = make_bake_target(tgt, args.texture_size)
+            bake_img_tuple = bake_tex_node
+            bake_img, basecolor_node = bake_img_tuple
             lum, dark = bake_color(
                 src, tgt, args.texture_size, args.bake_samples,
                 bake_img, cage_ratio=args.cage_ratio,
             )
             baked = True
             bake_quality = f"luminance={lum:.1f} dark_frac={dark:.2f}"
+
+            # PBR maps — the audit's #1 finding. Bake normal + roughness so the
+            # low-poly result carries surface relief and specular response
+            # instead of reading as a dead matte lump. Each is best-effort:
+            # a failed map must not lose us the working baseColor.
+            normal_img = rough_img = None
+            if not args.no_pbr:
+                normal_img, _ = bake_normal_map(
+                    src, tgt, args.texture_size, cage_ratio=args.cage_ratio
+                )
+                rough_img, _ = bake_roughness_map(src, tgt, args.texture_size)
+                wire_pbr_material(tgt, basecolor_node, normal_img, rough_img)
+                pbr_maps = (("normal " if normal_img else "")
+                            + ("roughness" if rough_img else "")) or "none"
         except Exception as e:
             log(f"BAKE FAILED: {e}")
             log(traceback.format_exc()[-1500:])
@@ -513,7 +651,7 @@ def main():
         f"DONE repair={repair_method} retopo={method} baked={baked} "
         f"{src_verts}v/{src_faces}f -> {out_verts}v/{out_faces}f | "
         f"watertight={boundary == 0} manifold={manifold_ok} "
-        f"quads={quad_pct}% (q{quads}/t{tris}/n{ngons}) bake[{bake_quality}]"
+        f"quads={quad_pct}% (q{quads}/t{tris}/n{ngons}) bake[{bake_quality}] pbr[{pbr_maps}]"
     )
 
 
