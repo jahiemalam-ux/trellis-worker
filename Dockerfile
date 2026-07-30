@@ -67,6 +67,40 @@ RUN pip install --no-cache-dir --force-reinstall --no-deps 'transformers==4.56.0
     pip install --no-cache-dir 'tokenizers>=0.20' 'safetensors' 'huggingface-hub==0.34.4' 'regex' 'pyyaml' 'numpy' 'packaging' 'tqdm' 'requests' && \
     python -c "import transformers; from transformers import DINOv3ViTModel; print('transformers', transformers.__version__)"
 
-ENV PYTHONPATH=/app/TRELLIS.2
+# --- Blender (headless) for retopology / UV / texture bake ---
+# Tarball rather than pip `bpy`: the wheel pins an exact Python version and the
+# base image's interpreter is not guaranteed to match.
+ARG BLENDER_VERSION=4.2.23
+ARG BLENDER_SERIES=4.2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xz-utils libxi6 libxxf86vm1 libxfixes3 libxrender1 libsm6 libice6 \
+    libxkbcommon0 libgomp1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL "https://download.blender.org/release/Blender${BLENDER_SERIES}/blender-${BLENDER_VERSION}-linux-x64.tar.xz" \
+      -o /tmp/blender.tar.xz && \
+    mkdir -p /opt/blender && \
+    tar -xJf /tmp/blender.tar.xz -C /opt/blender --strip-components=1 && \
+    rm /tmp/blender.tar.xz && \
+    /opt/blender/blender --background --version
+ENV BLENDER_BIN=/opt/blender/blender
+ENV BLENDER_SCRIPT=/app/blender_post.py
+
+# --- Text-to-image front-end (SDXL-Turbo) so prompts work, not just images ---
+# --no-deps guards the pinned transformers==4.56.0 that DINOv3 requires.
+RUN pip install --no-cache-dir --no-deps diffusers==0.31.0 && \
+    pip install --no-cache-dir accelerate sentencepiece && \
+    python -c "import diffusers; print('diffusers', diffusers.__version__)" && \
+    python -c "import transformers; print('transformers', transformers.__version__)"
+
+# Pre-fetch SDXL-Turbo weights at build time so first prompt isn't a long download.
+RUN python -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('stabilityai/sdxl-turbo', allow_patterns=['*.json','*.txt','*fp16*','*.safetensors'], ignore_patterns=['*.ckpt','*nonema*','*.bin'])" \
+    || echo "sdxl-turbo predownload failed, will fetch at runtime"
+
+COPY blender_post.py /app/blender_post.py
+COPY txt2img.py /app/txt2img.py
+
+ENV PYTHONPATH=/app/TRELLIS.2:/app
 WORKDIR /app
 CMD ["python", "-u", "api_server.py"]
