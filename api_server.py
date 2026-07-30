@@ -138,6 +138,14 @@ def blender_finish(raw_glb, inp, step=None):
     ]
     if inp.get("no_bake"):
         cmd.append("--no-bake")
+    if inp.get("no_repair"):
+        cmd.append("--no-repair")
+    # Default: refuse the decimate fallback, so we keep a closed quad mesh even
+    # if that means missing the face budget. Opt back in with allow_decimate.
+    if not inp.get("allow_decimate", False):
+        cmd.append("--no-decimate-fallback")
+    if inp.get("repair_detail"):
+        cmd += ["--repair-detail", str(int(inp["repair_detail"]))]
 
     if step: step("blender: starting")
     timeout = int(inp.get("blender_timeout", 900))

@@ -39,6 +39,12 @@ def parse_args():
     p.add_argument("--texture-size", type=int, default=2048)
     p.add_argument("--bake-samples", type=int, default=1)
     p.add_argument("--no-bake", action="store_true")
+    p.add_argument("--no-repair", action="store_true",
+                   help="skip manifold repair (quads/watertight become unlikely)")
+    p.add_argument("--no-decimate-fallback", action="store_true",
+                   help="never fall back to decimation; keep topology closed even if over budget")
+    p.add_argument("--repair-detail", type=int, default=200,
+                   help="voxel divisor for the repair pass; higher preserves more detail")
     p.add_argument("--smooth-shading", action="store_true", default=True)
     return p.parse_args(argv)
 
@@ -117,19 +123,95 @@ def is_manifold(obj):
     return bad == 0, bad
 
 
-def retopologize(obj, target_faces):
+def count_holes(obj):
+    """Boundary edges — a closed surface has none."""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    n = sum(1 for e in bm.edges if e.is_boundary)
+    bm.free()
+    return n
+
+
+def fill_holes(obj, max_sides=0):
+    """Cheap topological hole fill. max_sides=0 means no limit."""
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    try:
+        bpy.ops.mesh.fill_holes(sides=max_sides)
+    except Exception as e:
+        log(f"fill_holes failed: {e}")
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def make_manifold(obj, detail_divisor=200):
     """
-    Fallback chain, best topology first:
-      1. QuadriFlow  -> true quad field, needs manifold input
-      2. Voxel remesh (quads) + decimate to budget
-      3. Plain collapse decimate -> triangles, always works
+    Force the mesh closed and manifold so QuadriFlow will accept it.
+
+    This is the fix for both known defects: QuadriFlow is the only path that
+    yields true quads AND a watertight result, but it refuses non-manifold
+    input, so previously we fell through to decimation — which produces
+    triangles and reopens holes. Repairing first means QuadriFlow actually runs.
+
+    Escalates only as far as needed:
+      1. weld + fill holes           (cheap, shape-preserving)
+      2. OpenVDB voxel remesh        (guarantees a closed manifold shell)
     """
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
 
-    manifold, bad_edges = is_manifold(obj)
-    log(f"manifold={manifold} (non-manifold edges: {bad_edges})")
+    manifold, bad = is_manifold(obj)
+    holes = count_holes(obj)
+    log(f"repair: start manifold={manifold} bad_edges={bad} boundary_edges={holes}")
+
+    if not manifold or holes:
+        fill_holes(obj)
+        manifold, bad = is_manifold(obj)
+        holes = count_holes(obj)
+        log(f"repair: after fill_holes manifold={manifold} bad_edges={bad} boundary_edges={holes}")
+
+    if manifold and holes == 0:
+        return True, "fill_holes"
+
+    # Voxel remesh rebuilds the surface from a signed distance field, which is
+    # closed and manifold by construction. Detail is set high here on purpose:
+    # this pass exists to fix topology, and QuadriFlow reduces the count after.
+    try:
+        dims = obj.dimensions
+        largest = max(dims.x, dims.y, dims.z) or 1.0
+        obj.data.remesh_voxel_size = max(largest / detail_divisor, 1e-4)
+        obj.data.remesh_voxel_adaptivity = 0.0
+        bpy.ops.object.voxel_remesh()
+        manifold, bad = is_manifold(obj)
+        holes = count_holes(obj)
+        log(f"repair: voxel_remesh @ {obj.data.remesh_voxel_size:.5f} -> "
+            f"{mesh_stats(obj)[1]} faces manifold={manifold} boundary_edges={holes}")
+        if holes:
+            fill_holes(obj)
+            holes = count_holes(obj)
+        return (is_manifold(obj)[0] and holes == 0), "voxel_remesh"
+    except Exception as e:
+        log(f"repair: voxel_remesh failed: {e}")
+        return False, "failed"
+
+
+def retopologize(obj, target_faces, allow_decimate=True):
+    """
+    Reduce to the face budget, preferring topology that stays closed and quad.
+
+      1. QuadriFlow at target_faces  -> true quads, watertight, exact budget
+      2. Voxel remesh sized to hit the budget directly (NO trailing decimate,
+         since decimating is what reopened holes before)
+      3. Decimate  -> triangles, breaks watertight; only if allow_decimate
+
+    Note there is deliberately no decimate after remeshing anymore.
+    """
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+
+    manifold, bad = is_manifold(obj)
 
     if manifold:
         try:
@@ -140,41 +222,55 @@ def retopologize(obj, target_faces):
                 use_mesh_symmetry=False,
                 smooth_normals=True,
             )
-            log(f"retopo: quadriflow -> {mesh_stats(obj)[1]} faces")
+            log(f"retopo: quadriflow -> {mesh_stats(obj)[1]} faces "
+                f"(watertight={count_holes(obj) == 0})")
             return "quadriflow"
         except Exception as e:
-            log(f"quadriflow failed: {e}")
+            log(f"quadriflow failed even on manifold input: {e}")
+    else:
+        log(f"retopo: skipping quadriflow, still non-manifold ({bad} edges)")
 
-    # Voxel remesh produces a clean manifold quad-ish surface from messy input.
+    # Search a voxel size that lands near the budget, instead of remeshing
+    # coarsely and then decimating (which is what broke watertightness).
     try:
         dims = obj.dimensions
         largest = max(dims.x, dims.y, dims.z) or 1.0
-        # Aim for roughly sqrt(target_faces) quads across the widest axis.
-        voxel = largest / max(int((target_faces ** 0.5) * 1.5), 32)
-        obj.data.remesh_voxel_size = max(voxel, 1e-4)
-        obj.data.remesh_voxel_adaptivity = 0.0
-        bpy.ops.object.voxel_remesh()
-        log(f"retopo: voxel_remesh @ {obj.data.remesh_voxel_size:.5f} -> {mesh_stats(obj)[1]} faces")
-
-        cur = mesh_stats(obj)[1]
-        if cur > target_faces * 1.1:
-            m = obj.modifiers.new("dec", "DECIMATE")
-            m.decimate_type = "COLLAPSE"
-            m.ratio = target_faces / cur
-            bpy.ops.object.modifier_apply(modifier=m.name)
-            log(f"retopo: + decimate -> {mesh_stats(obj)[1]} faces")
-        return "voxel_remesh"
+        base = obj.data.copy()
+        best = None
+        lo, hi = largest / 400.0, largest / 12.0
+        for _ in range(7):
+            mid = (lo + hi) / 2.0
+            obj.data = base.copy()
+            obj.data.remesh_voxel_size = max(mid, 1e-4)
+            obj.data.remesh_voxel_adaptivity = 0.0
+            bpy.ops.object.voxel_remesh()
+            n = mesh_stats(obj)[1]
+            if best is None or abs(n - target_faces) < abs(best[1] - target_faces):
+                best = (mid, n, obj.data.copy())
+            if n > target_faces:
+                lo = mid          # too dense -> larger voxels
+            else:
+                hi = mid
+        if best:
+            obj.data = best[2]
+            log(f"retopo: voxel_remesh tuned @ {best[0]:.5f} -> {mesh_stats(obj)[1]} faces "
+                f"(watertight={count_holes(obj) == 0}, no decimate)")
+            return "voxel_remesh_tuned"
     except Exception as e:
-        log(f"voxel remesh failed: {e}")
+        log(f"tuned voxel remesh failed: {e}")
 
     cur = mesh_stats(obj)[1]
-    if cur > target_faces:
+    if allow_decimate and cur > target_faces:
         m = obj.modifiers.new("dec", "DECIMATE")
         m.decimate_type = "COLLAPSE"
         m.ratio = target_faces / cur
         bpy.ops.object.modifier_apply(modifier=m.name)
-    log(f"retopo: decimate only -> {mesh_stats(obj)[1]} faces")
-    return "decimate"
+        log(f"retopo: decimate fallback -> {mesh_stats(obj)[1]} faces "
+            f"(WARNING: triangles, may not be watertight)")
+        return "decimate"
+
+    log(f"retopo: left as-is at {cur} faces")
+    return "none"
 
 
 def unwrap(obj, angle_limit=66.0, island_margin=0.002):
@@ -298,7 +394,15 @@ def main():
     tgt.name = "RETOPO"
 
     clean_mesh(tgt)
-    method = retopologize(tgt, args.target_faces)
+
+    repaired, repair_method = (False, "skipped")
+    if not args.no_repair:
+        repaired, repair_method = make_manifold(tgt, args.repair_detail)
+        log(f"repair: {'OK' if repaired else 'INCOMPLETE'} via {repair_method}")
+
+    method = retopologize(
+        tgt, args.target_faces, allow_decimate=not args.no_decimate_fallback
+    )
     unwrap(tgt)
 
     baked = False
@@ -324,9 +428,27 @@ def main():
     export_glb(tgt, args.output, args.texture_size)
 
     out_verts, out_faces = mesh_stats(tgt)
+
+    # Report the two properties that were previously wrong, so regressions show
+    # up in the job log instead of needing an offline mesh inspection.
+    boundary = count_holes(tgt)
+    manifold_ok = is_manifold(tgt)[0]
+    quads = tris = ngons = 0
+    for poly in tgt.data.polygons:
+        n = len(poly.vertices)
+        if n == 4:
+            quads += 1
+        elif n == 3:
+            tris += 1
+        else:
+            ngons += 1
+    quad_pct = round(100.0 * quads / max(out_faces, 1), 1)
+
     log(
-        f"DONE retopo={method} baked={baked} "
-        f"{src_verts}v/{src_faces}f -> {out_verts}v/{out_faces}f"
+        f"DONE repair={repair_method} retopo={method} baked={baked} "
+        f"{src_verts}v/{src_faces}f -> {out_verts}v/{out_faces}f | "
+        f"watertight={boundary == 0} manifold={manifold_ok} "
+        f"quads={quad_pct}% (q{quads}/t{tris}/n{ngons})"
     )
 
 
