@@ -31,10 +31,12 @@ _LOAD_ERROR = None
 POSITIVE_SUFFIX = (
     "single centered object, full object visible, plain neutral background, "
     "even diffuse studio lighting, sharp focus, product photograph, "
-    "no shadows on background, 3/4 view"
+    "no shadows on background, 3/4 view, one single subject only"
 )
 NEGATIVE_PROMPT = (
-    "multiple objects, cropped, cut off, partial view, busy background, scenery, "
+    "multiple objects, duplicate, two of the same object, collage, grid, "
+    "repeated subject, split image, cropped, cut off, partial view, "
+    "busy background, scenery, "
     "text, watermark, people, hands, harsh shadows, motion blur, reflections, "
     "extreme close-up, tiling"
 )
@@ -120,9 +122,10 @@ def generate(
     seed=42,
     steps=4,
     guidance=0.0,
-    size=1024,
+    size=512,
     style_wrap=True,
     negative_prompt=None,
+    allow_highres=False,
 ):
     """
     Render a prompt to a PIL image suitable for TRELLIS conditioning.
@@ -141,7 +144,15 @@ def generate(
         log(f"guidance {guidance} ignored (turbo is CFG-free)")
         guidance = 0.0
 
-    size = max(512, min(int(size), 1024))
+    # SDXL-Turbo is distilled at 512x512. Sampling above native resolution makes
+    # it duplicate the subject — a car prompt at 1024 returned FOUR overlapping
+    # cars, which TRELLIS then fused into one mangled mesh. Clamp to 512 unless
+    # the caller explicitly opts out.
+    size = int(size)
+    if size > 512 and not allow_highres:
+        log(f"size {size} above turbo's native 512; clamping to avoid duplication")
+        size = 512
+    size = max(256, min(size, 1024))
     full = _build_prompt(prompt, style_wrap)
     gen = torch.Generator(device="cpu").manual_seed(int(seed))
 

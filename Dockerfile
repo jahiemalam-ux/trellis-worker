@@ -98,6 +98,7 @@ RUN pip install --no-cache-dir --no-deps diffusers==0.31.0 && \
 
 COPY blender_post.py /app/blender_post.py
 COPY txt2img.py /app/txt2img.py
+COPY subject_check.py /app/subject_check.py
 
 ENV PYTHONPATH=/app/TRELLIS.2:/app
 WORKDIR /app

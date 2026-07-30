@@ -146,6 +146,8 @@ def blender_finish(raw_glb, inp, step=None):
         cmd.append("--no-decimate-fallback")
     if inp.get("repair_detail"):
         cmd += ["--repair-detail", str(int(inp["repair_detail"]))]
+    if inp.get("cage_ratio"):
+        cmd += ["--cage-ratio", str(float(inp["cage_ratio"]))]
 
     if step: step("blender: starting")
     timeout = int(inp.get("blender_timeout", 900))
@@ -201,6 +203,37 @@ def run_job(jid, inp):
         for b in b64s:
             images.append(rembg_image(b))
         step(f"rembg done x{len(images)}")
+
+        # Reject collages before spending GPU minutes on them. A multi-object
+        # conditioning image is the difference between a clean mesh and two cars
+        # fused together, and it is otherwise a completely silent failure.
+        if inp.get("subject_check", True):
+            try:
+                import subject_check
+                max_reroll = int(inp.get("t2i_max_reroll", 2)) if prompt_image_b64 else 0
+                for attempt in range(max_reroll + 1):
+                    single, info = subject_check.analyze(images[0])
+                    step(f"subject check: single={single} {info}")
+                    if single or len(images) > 1:
+                        break
+                    if attempt < max_reroll:
+                        # Only a fresh seed can fix a collage; same seed repeats it.
+                        new_seed = int(inp.get("seed", 42)) + 1000 * (attempt + 1)
+                        step(f"multi-object image, rerolling t2i seed={new_seed}")
+                        import txt2img
+                        prompt_image_b64 = txt2img.generate_b64(
+                            inp["prompt"], seed=new_seed,
+                            steps=int(inp.get("t2i_steps", 4)),
+                            size=int(inp.get("t2i_size", 1024)),
+                            style_wrap=True,
+                        )
+                        txt2img.unload()
+                        images = [rembg_image(prompt_image_b64)]
+                    else:
+                        images[0] = subject_check.isolate_main(images[0])
+                        step("rerolls exhausted, isolated largest subject")
+            except Exception as e:
+                step(f"subject check skipped: {e}")
 
         seed = int(inp.get("seed", 42))
         pipeline_type = inp.get("pipeline_type", "1024_cascade")

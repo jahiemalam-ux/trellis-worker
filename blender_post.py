@@ -19,6 +19,7 @@ Design notes:
 
 import bpy
 import bmesh
+import numpy as np
 import sys
 import os
 import argparse
@@ -38,6 +39,8 @@ def parse_args():
     p.add_argument("--target-faces", type=int, default=20000)
     p.add_argument("--texture-size", type=int, default=2048)
     p.add_argument("--bake-samples", type=int, default=1)
+    p.add_argument("--cage-ratio", type=float, default=0.05,
+                   help="bake cage extrusion as a fraction of the bounding box")
     p.add_argument("--no-bake", action="store_true")
     p.add_argument("--no-repair", action="store_true",
                    help="skip manifold repair (quads/watertight become unlikely)")
@@ -338,14 +341,22 @@ def make_bake_target(obj, texture_size):
     return img, tex
 
 
-def bake_color(src, tgt, texture_size, samples):
-    """Bake SOURCE's base color onto TGT's new UVs via selected_to_active."""
+def image_luminance(img):
+    """Mean 0-255 luminance of a Blender image, for verifying a bake worked."""
+    n = len(img.pixels)
+    buf = np.empty(n, dtype=np.float32)
+    img.pixels.foreach_get(buf)
+    rgb = buf.reshape(-1, 4)[:, :3]
+    return float(rgb.mean() * 255.0), float((rgb.max(axis=1) < 0.1).mean())
+
+
+def _do_bake(src, tgt, extrusion, samples, margin):
     scene = bpy.context.scene
     scene.cycles.samples = max(samples, 1)
     scene.render.bake.use_selected_to_active = True
     scene.render.bake.use_cage = False
-    scene.render.bake.cage_extrusion = 0.02
-    scene.render.bake.margin = max(texture_size // 256, 4)
+    scene.render.bake.cage_extrusion = extrusion
+    scene.render.bake.margin = margin
     scene.render.bake.use_clear = True
 
     bpy.ops.object.select_all(action="DESELECT")
@@ -357,10 +368,50 @@ def bake_color(src, tgt, texture_size, samples):
         type="DIFFUSE",
         pass_filter={"COLOR"},
         use_selected_to_active=True,
-        cage_extrusion=0.02,
-        margin=scene.render.bake.margin,
+        cage_extrusion=extrusion,
+        margin=margin,
     )
-    log("bake: diffuse/color complete")
+
+
+def bake_color(src, tgt, texture_size, samples, img, cage_ratio=0.05):
+    """
+    Bake SOURCE's base color onto TGT's new UVs via selected_to_active.
+
+    cage_extrusion MUST scale with the object. It used to be hardcoded at 0.02,
+    which happened to work on a small mug but failed badly on a car: the manifold
+    repair displaces the retopo surface away from the original, and when that gap
+    exceeds the extrusion the bake rays miss entirely and return black (observed:
+    47% near-black texels, mean luminance 34/255 on a silver car).
+
+    So: size the cage from the bounding box, then verify the result and escalate
+    if it still came out dark.
+    """
+    dims = src.dimensions
+    largest = max(dims.x, dims.y, dims.z) or 1.0
+    margin = max(texture_size // 256, 4)
+
+    attempts = [cage_ratio, cage_ratio * 3.0, cage_ratio * 8.0]
+    best = None
+    for i, ratio in enumerate(attempts):
+        extrusion = max(largest * ratio, 1e-4)
+        _do_bake(src, tgt, extrusion, samples, margin)
+        lum, dark_frac = image_luminance(img)
+        log(f"bake: attempt {i+1} extrusion={extrusion:.4f} "
+            f"(={ratio:.3f} x {largest:.3f}) -> luminance={lum:.1f}/255 "
+            f"dark_frac={dark_frac:.2f}")
+        if best is None or lum > best[0]:
+            best = (lum, extrusion, dark_frac)
+        # A good bake on a lit subject lands well above this; near-black means
+        # the rays are missing the source surface.
+        if lum >= 45.0 and dark_frac <= 0.35:
+            log(f"bake: OK on attempt {i+1}")
+            return lum, dark_frac
+        if i < len(attempts) - 1:
+            log("bake: too dark, retrying with a larger cage")
+
+    log(f"bake: WARNING still dark after {len(attempts)} attempts "
+        f"(best luminance {best[0]:.1f}) — texture may be unusable")
+    return best[0], best[2]
 
 
 def export_glb(obj, path, texture_size):
@@ -415,11 +466,16 @@ def main():
     unwrap(tgt)
 
     baked = False
+    bake_quality = "n/a"
     if not args.no_bake:
         try:
-            make_bake_target(tgt, args.texture_size)
-            bake_color(src, tgt, args.texture_size, args.bake_samples)
+            bake_img, _ = make_bake_target(tgt, args.texture_size)
+            lum, dark = bake_color(
+                src, tgt, args.texture_size, args.bake_samples,
+                bake_img, cage_ratio=args.cage_ratio,
+            )
             baked = True
+            bake_quality = f"luminance={lum:.1f} dark_frac={dark:.2f}"
         except Exception as e:
             log(f"BAKE FAILED: {e}")
             log(traceback.format_exc()[-1500:])
@@ -457,7 +513,7 @@ def main():
         f"DONE repair={repair_method} retopo={method} baked={baked} "
         f"{src_verts}v/{src_faces}f -> {out_verts}v/{out_faces}f | "
         f"watertight={boundary == 0} manifold={manifold_ok} "
-        f"quads={quad_pct}% (q{quads}/t{tris}/n{ngons})"
+        f"quads={quad_pct}% (q{quads}/t{tris}/n{ngons}) bake[{bake_quality}]"
     )
 
 
