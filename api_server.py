@@ -9,6 +9,38 @@ LOAD_ERROR = None
 BOOT_LOG = []
 _REMBG_SESSION = None
 JOBS = {}  # id -> {status, result, error}
+JOBS_DIR = os.environ.get("JOBS_DIR", "/tmp/trellis_jobs")
+os.makedirs(JOBS_DIR, exist_ok=True)
+
+
+def _job_path(jid):
+    # Guard against path traversal from the URL-derived id.
+    safe = "".join(c for c in jid if c.isalnum())
+    return os.path.join(JOBS_DIR, f"{safe}.json")
+
+
+def persist_job(jid):
+    """
+    Mirror a job to disk so a container restart (OOM during the Blender stage
+    has been observed) doesn't vaporize a completed result. The GLB base64 is
+    large, but a few MB on local disk is cheap next to re-running a 6-minute job.
+    """
+    try:
+        with open(_job_path(jid), "w") as f:
+            json.dump(JOBS[jid], f)
+    except Exception as e:
+        print(f"[persist] {jid} failed: {e}", flush=True)
+
+
+def load_job(jid):
+    """In-memory first; fall back to disk if a restart cleared the dict."""
+    if jid in JOBS:
+        return JOBS[jid]
+    try:
+        with open(_job_path(jid)) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 BLENDER_BIN = os.environ.get("BLENDER_BIN", "/opt/blender/blender")
 BLENDER_SCRIPT = os.environ.get("BLENDER_SCRIPT", "/app/blender_post.py")
@@ -283,6 +315,27 @@ def run_job(jid, inp):
         if prompt_image_b64 and inp.get("return_prompt_image", True):
             result["prompt_image_b64"] = prompt_image_b64
 
+        # Free the TRELLIS mesh and CUDA cache before spawning Blender. The
+        # Blender subprocess plus the resident 4B model has OOM-killed the
+        # container mid-bake; dropping the mesh first cuts the peak.
+        try:
+            del mesh
+            import torch, gc
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        # Checkpoint the raw result to disk BEFORE the risky Blender stage, so an
+        # OOM restart during baking still leaves a recoverable (unprocessed) mesh
+        # instead of losing the whole 6-minute job.
+        JOBS[jid]["result"] = {"engine": "trellis2-4b",
+                               "glb_b64": b64_of(raw_glb),
+                               "postprocessed": False,
+                               "checkpoint": "pre-blender"}
+        JOBS[jid]["status"] = "blender_pending"
+        persist_job(jid)
+
         # --- Stage 4: Blender finishing (opt-in) ---
         if inp.get("blender_post", False):
             try:
@@ -304,9 +357,11 @@ def run_job(jid, inp):
         JOBS[jid]["result"] = result
         step("job complete")
         JOBS[jid]["status"] = "done"
+        persist_job(jid)
     except Exception as e:
         JOBS[jid]["error"] = f"{e}\n{traceback.format_exc()[-2500:]}"
         JOBS[jid]["status"] = "failed"
+        persist_job(jid)
 
 class H(BaseHTTPRequestHandler):
     def _send(self, code, obj):
@@ -333,7 +388,7 @@ class H(BaseHTTPRequestHandler):
                              "log": BOOT_LOG[-25:]})
         elif self.path.startswith("/job/"):
             jid = self.path[5:]
-            j = JOBS.get(jid)
+            j = load_job(jid)
             if not j:
                 return self._send(404, {"error": "unknown job"})
             out = {"status": j["status"], "steps": j.get("steps", [])}
