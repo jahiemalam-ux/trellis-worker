@@ -70,8 +70,8 @@ RUN pip install --no-cache-dir --force-reinstall --no-deps 'transformers==4.56.0
 # --- Blender (headless) for retopology / UV / texture bake ---
 # Tarball rather than pip `bpy`: the wheel pins an exact Python version and the
 # base image's interpreter is not guaranteed to match.
-ARG BLENDER_VERSION=4.2.23
-ARG BLENDER_SERIES=4.2
+ARG BLENDER_VERSION=5.2.0
+ARG BLENDER_SERIES=5.2
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils libxi6 libxxf86vm1 libxfixes3 libxrender1 libsm6 libice6 \
     libxkbcommon0 libgomp1 && \
